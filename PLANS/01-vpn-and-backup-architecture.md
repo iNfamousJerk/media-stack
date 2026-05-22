@@ -1,8 +1,9 @@
-# VPN + Backup Architecture Plan
+# VPN + Backup + Auto-Ripping Architecture Plan
 
-> **Status:** Draft / Proposed
-> **Author:** Hermes
-> **Date:** 2026-05-22
+> **Status:** Draft / Proposed  
+> **Author:** Hermes  
+> **Date:** 2026-05-22  
+> **Updated:** 2026-05-22 — Added auto-ripping machine, revised PBS for same-host + existing HDDs
 
 ---
 
@@ -75,128 +76,341 @@ TZ=America/New_York
 
 ---
 
-## Part 2: Proxmox Backup Server + Media Backup
+## Part 2: Proxmox Backup Server (Same-Host with Existing HDDs)
 
 ### Goal
 
-Set up a second physical (or VM/LXC) node running Proxmox Backup Server (PBS) with a mount point for media file backups. Keep copies of `/data/media` in case the primary node fails.
+Set up Proxmox Backup Server **on the same Proxmox host** as an LXC, using your existing HDDs (2× 1TB + 1× 2TB). This protects against data corruption and accidental deletion, but NOT against full hardware failure (no second machine yet — you can add that later for true DR).
 
-### Architecture
+### What PBS Protects vs. What Doesn't
+
+| Scenario | Survives? | Notes |
+|----------|-----------|-------|
+| Accidental file deletion | ✅ | Restore from rsync backup |
+| Disk corruption on media drive | ✅ | Restore from PBS + rsync |
+| Docker config broken | ✅ | CT-level PBS backup restores entire container |
+| Whole Proxmox host dies | ❌ | Need second node for true DR |
+| Fire / theft / power surge | ❌ | Need off-site backup for this |
+
+### Disk Layout Plan with Your HDDs
+
+You have 3 drives to work with. Here's the recommended layout:
 
 ```
-┌─────────────────────────────────┐     ┌──────────────────────────────────┐
-│       Node A (Primary)          │     │       Node B (Backup)            │
-│   Proxmox VE + Media CT/VM      │     │   Proxmox Backup Server          │
-│                                 │     │                                  │
-│  ┌─────────────────────────┐    │     │  ┌──────────────────────────┐    │
-│  │ /data/media/            │    │     │  │ /datastore/proxmox/      │    │
-│  │   movies/               │────┼─────┼──│   (VM/CT backups via PBS) │    │
-│  │   tv/                   │    │ rsync│  └──────────────────────────┘    │
-│  │   music/                │    │     │                                  │
-│  └─────────────────────────┘    │     │  ┌──────────────────────────┐    │
-│                                 │     │  │ /datastore/media/        │    │
-│  ┌─────────────────────────┐    │────┼────│   movies/                │    │
-│  │ /data/torrents/         │    │ rsync│   tv/                     │    │
-│  │   (no backup needed)    │    │     │   music/                   │    │
-│  └─────────────────────────┘    │     │  └──────────────────────────┘    │
-│                                 │     │                                  │
-│  ┌─────────────────────────┐    │     │  (Optional)                     │
-│  │ Media stack (Docker)     │    │     │  ┌──────────────────────────┐    │
-│  └─────────────────────────┘    │     │  │ Cold storage /           │    │
-│                                 │     │  │ Off-site archive (glacier)│    │
-└─────────────────────────────────┘     │  └──────────────────────────┘    │
-                                        └──────────────────────────────────┘
+┌─ Proxmox Host ─────────────────────────────────────────────┐
+│                                                             │
+│  1TB SSD (boot drive) — PVE OS + Docker + /data/media       │
+│                                                             │
+│  2× 1TB HDDs ──→ ZFS Mirror (1TB usable)                   │
+│                    PBS LXC datastore for VM/CT backups      │
+│                    (redundant — if one drive dies, keep     │
+│                     your Proxmox container backups)         │
+│                                                             │
+│  1× 2TB HDD  ──→ Standalone ext4/XFS                       │
+│                    Mounted into PBS LXC                     │
+│                    rsync target for /data/media backup      │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### Key Decisions
+**Total usable backup capacity:** ~3 TB (1 TB for CT backups, 2 TB for media)
+**Why a mirror for the 1TB drives?** The most important backup is your Docker configs, *arr databases, and OS state. Those are tiny files that change often — ZFS mirror + PBS dedup keeps them safe with redundancy. The media files are large but mostly static, so they go on the larger 2TB drive as a daily rsync target.
 
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| PBS host | **Second Proxmox node** (physical recommended) | True disaster recovery — if the main node dies, PBS on a separate machine survives. If you don't have a second machine, run PBS as a privileged LXC on the same host, but this only protects against data corruption, not hardware failure. |
-| PBS storage | **Separate disk or ZFS pool** | Don't store PBS datastore on the same disk as the media. Dedicated spinning rust or RAID is ideal. |
-| Media backup method | **rsync + cron, not PBS datastore** | PBS is amazing for VM/CT backups (dedup, incremental, encrypted). But for raw media files (large, mostly static), a simple rsync is more efficient. Mount a PBS directory or NFS share as the target. |
-| VM/CT backups | **Native PBS client** | Use Proxmox's built-in backup to PBS for the entire media CT. This captures the OS, Docker configs, everything. |
-| Schedule | **Daily rsync for media, Weekly PBS backups for CT** | Media doesn't change fast enough to need hourly. CT backup weekly captures config changes. |
-| Transport | **SSH + rsync over LAN** | If on same switch, use private IPs. No sensitive data crossing the WAN. |
+### Alternative: MergerFS Single Pool
+
+If you don't care about redundancy and just want max capacity:
+
+```
+2× 1TB + 1× 2TB ──→ mergerfs pool (~4TB JBOD) ──→ split as:
+                       │  ├── /datastore/proxmox (500 GB for CT backups)
+                       │  └── /datastore/media   (3.5 TB for media rsync)
+```
+
+Simpler but if any drive dies you lose that drive's data.
+
+### Architecture Diagram
+
+```
+┌─ Proxmox Host ─────────────────────────────────────────────────────┐
+│                                                                     │
+│  ┌─ Media CT (Docker) ─────────────────────┐                       │
+│  │                                         │                       │
+│  │  qbittorrent │ radarr │ sonarr │ ...    │                       │
+│  │  └─ /data/media ──┐                     │                       │
+│  └───────────────────┼─────────────────────┘                       │
+│                      │                                             │
+│                      │  daily rsync                                │
+│                      ▼                                             │
+│  ┌─ PBS LXC ───────────────────────────────┐                       │
+│  │                                         │                       │
+│  │  PBS Web UI : 8007                      │                       │
+│  │  ┌─────────────────────────────────┐    │                       │
+│  │  │ /datastore/proxmox/             │    │ ← ZFS mirror (2×1TB) │
+│  │  │   (CT backups via PBS native)   │    │                       │
+│  │  └─────────────────────────────────┘    │                       │
+│  │  ┌─────────────────────────────────┐    │                       │
+│  │  │ /mnt/media-backups/             │    │ ← 2TB HDD (ext4)     │
+│  │  │   (daily/ dirs with hard-links) │    │                       │
+│  │  └─────────────────────────────────┘    │                       │
+│  └─────────────────────────────────────────┘                       │
+│                                                                     │
+│  ┌─ Auto-Ripper CT ────────────────────────┐                       │
+│  │  ARM Web UI : 8085                      │                       │
+│  │  MakeMKV → HandBrake → /data/media      │                       │
+│  │  USB Blu-ray drive passed through       │                       │
+│  └─────────────────────────────────────────┘                       │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
 ### Implementation Plan
 
-#### Step 1: Set up Proxmox Backup Server
+#### Step 1: Prepare the HDDs
 
-1. Download PBS ISO or install on Debian: `apt install proxmox-backup-server`
-2. Create a datastore: `proxmox-backup-manager datastore create proxmox /datastore/proxmox`
-3. Create a media backup datastore: `proxmox-backup-manager datastore create media /datastore/media`
-4. Configure authentication (API token or user/pass)
+```bash
+# Identify your drives
+lsblk -o NAME,SIZE,MODEL,MOUNTPOINT
 
-#### Step 2: Configure Proxmox to Back Up the Media CT
+# Option A: ZFS mirror for 2× 1TB drives
+apt install zfsutils-linux
+zpool create -f pbs-pool mirror /dev/sdb /dev/sdc
 
-In the Proxmox web UI:
-1. Select the media CT → Backup → Add
-2. Schedule: Weekly (e.g., Sunday 3 AM)
-3. Storage: PBS datastore
-4. Mode: Snapshot (no downtime)
+# Option B: Simple ext4 (simpler, no redundancy)
+mkfs.ext4 /dev/sdb  # 1TB
+mkfs.ext4 /dev/sdc  # 1TB
+mkfs.ext4 /dev/sdd  # 2TB
+```
 
-#### Step 3: Set Up Media rsync to PBS
+#### Step 2: Create PBS LXC
 
-On the **media CT**, create a backup script:
+Create a privileged LXC (CT 250, for example) on Proxmox with:
+- 2-4 GB RAM, 2-4 cores
+- 16 GB root disk (PBS doesn't need much for the OS)
+- **Mount points** for your HDDs:
+  - ZFS mirror at `/datastore/proxmox` (inside the LXC)
+  - 2TB HDD at `/mnt/media-backups` (inside the LXC)
+- Network: static IP on your homelab subnet
+
+Pass through the HDDs to the LXC via Proxmox's mount point feature (`mp0`, `mp1`, etc.)
+
+#### Step 3: Install PBS Inside the LXC
+
+```bash
+# On the PBS LXC (Debian/Ubuntu)
+apt update && apt upgrade -y
+echo "deb http://download.proxmox.com/debian/pbs $(lsb_release -cs) pbs-no-subscription" > /etc/apt/sources.list.d/pbs.list
+wget -q https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg -O /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg
+apt update
+apt install proxmox-backup-server -y
+
+# Create datastore for CT backups
+proxmox-backup-manager datastore create proxmox /datastore/proxmox
+
+# Create PBS user for authentication
+proxmox-backup-manager user create backup-user@pbs
+proxmox-backup-manager user update backup-user@pbs --password <password>
+```
+
+#### Step 4: Configure Proxmox to Back Up the Media CT
+
+In the Proxmox web UI → Datacenter → Storage → Add → Proxmox Backup Server:
+- ID: `pbs`
+- Server: IP of PBS LXC
+- Datastore: `proxmox`
+- Username: `backup-user@pbs`
+- Password: as set above
+
+Then select the media CT → Backup → Add → Schedule: Weekly (Sunday 3 AM) → Storage: pbs
+
+#### Step 5: Set Up Media rsync to PBS
+
+On the **media CT** (where Docker runs), create a backup script:
 
 ```bash
 #!/bin/bash
 # /usr/local/bin/backup-media.sh
-# Runs via cron. Syncs /data/media to PBS media mount.
+# Daily rsync of /data/media to PBS LXC's 2TB HDD
 
-PBS_HOST="10.2.7.x"  # PBS node IP
-PBS_MEDIA_MOUNT="/mnt/pbs-media-backup"
-RSYNC_DEST="$PBS_MEDIA_MOUNT/$(date +%Y-%m-%d)"
+PBS_HOST="10.2.7.250"       # PBS LXC IP
+SSH_PORT=22
+MEDIA_MOUNT="/mnt/pbs-media-backup"
 
-# Mount PBS NFS share (if using NFS export)
-# mount -t nfs "$PBS_HOST:/datastore/media" "$PBS_MEDIA_MOUNT"
+# Mount via SSHFS (no NFS server needed on PBS)
+mkdir -p "$MEDIA_MOUNT"
+sshfs root@$PBS_HOST:/mnt/media-backups "$MEDIA_MOUNT" -o reconnect,ServerAliveInterval=15
 
-# Rsync with hard-link rotation (space efficient)
+# rsync with hard-link rotation
 rsync -avh --delete \
-  --link-dest="$PBS_MEDIA_MOUNT/latest" \
-  /data/media/ "$RSYNC_DEST/"
+  --link-dest="$MEDIA_MOUNT/latest" \
+  /data/media/ "$MEDIA_MOUNT/$(date +%Y-%m-%d)/"
 
-# Update 'latest' symlink
-rm -f "$PBS_MEDIA_MOUNT/latest"
-ln -s "$(date +%Y-%m-%d)" "$PBS_MEDIA_MOUNT/latest"
+# Update latest symlink
+rm -f "$MEDIA_MOUNT/latest"
+ln -s "$(date +%Y-%m-%d)" "$MEDIA_MOUNT/latest"
+
+# Unmount
+umount "$MEDIA_MOUNT"
 ```
 
 Cron: `0 2 * * * /usr/local/bin/backup-media.sh`
 
-#### Step 4: Configure PBS Access
+#### Step 6: Verify Restore Works
 
-Options for mounting PBS storage on the media CT:
-- **NFS export** from PBS → mount on media CT (simplest)
-- **SSHFS** from media CT → PBS datastore (no NFS setup needed)
-- **SMB/CIFS** if already using a NAS
-
-### Hardware Requirements
-
-**Minimum for PBS node (dedicated):**
-- CPU: 2+ cores (any modern x86)
-- RAM: 4-8 GB
-- Storage: At least 1.5× your media library size (for dedup + incremental overhead)
-- Network: 1 Gbps (preferred, 100 Mbps minimum)
-
-**If running PBS as an LXC on the same host:**
-- Not true disaster recovery, but protects against data corruption
-- Give it 4 GB RAM, 4 cores, and a separate ZFS dataset/disk
-- Mount point for the PBS datastore must be on a different physical disk than /data/media
-
-### Recommended Disk Layout (PBS Node)
-
-```
-sda (256 GB NVMe) — OS + PBS installation
-sdb (4 TB HDD)    — PBS datastore for VM/CT backups
-sdc (8 TB HDD)    — PBS datastore for media rsync target
-```
-
-Or use a single large ZFS pool if that's all you have.
+Test by restoring the media CT from PBS backup to validate the pipeline.
 
 ---
 
-## Part 3: Migration Path
+## Part 3: Auto-Ripping Machine
+
+### Goal
+
+Plug in a USB Blu-ray drive, insert a disc, and have it automatically rip, name, and organize into Jellyfin — no manual steps. Ripped files also get backed up by the daily rsync to PBS.
+
+### Architecture
+
+```
+┌─ Auto-Ripper CT ────────────────────────────────────────────┐
+│                                                              │
+│  USB Blu-ray drive ──→ Detect disc inserted                 │
+│       │                      (udev / ARM daemon)             │
+│       ▼                                                     │
+│  MakeMKV ──→ Raw MKV rip (or decrypted ISO)                 │
+│       │                                                     │
+│       ▼                                                     │
+│  HandBrakeCLI ──→ Transcode to H.265 (optional)              │
+│       │                                                     │
+│       ▼                                                     │
+│  FileBot / post-processing ──→ Rename & organize             │
+│       │                                                     │
+│       ▼                                                     │
+│  /data/media/movies/  ──→ Jellyfin picks up automatically   │
+│       │                                                     │
+│       ▼ (same night)                                        │
+│  PBS rsync backup ──→ Ripped movie is also backed up        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Software Choice: ARM (Automatic Ripping Machine)
+
+**ARM** is the gold standard for this — it's a full Docker-based solution with:
+- Web UI for monitoring and configuration
+- MakeMKV integration for Blu-ray/DVD decryption
+- Optional HandBrake transcoding
+- Built-in file naming and organization
+- Can output directly to your media folders
+
+There's also **Auto-MKV** (simpler, no web UI) and the manual route with udev rules, but ARM is the most set-and-forget.
+
+### What You Need to Buy
+
+| Item | Estimated Cost | Notes |
+|------|---------------|-------|
+| **USB Blu-ray drive** | $60-100 | LG BP60NB10 or similar. Must be UHD-friendly if you want 4K Blu-rays. |
+| **Blank disc space** | Free | Already part of your /data/media |
+
+You can also use an internal SATA Blu-ray drive with a USB adapter if you have one lying around.
+
+### Implementation Plan
+
+#### Step 1: Create a Dedicated CT for the Ripper
+
+Create a new CT (e.g., CT 110) with:
+- 2 GB RAM, 2 cores
+- 16 GB root disk
+- **USB passthrough** for the Blu-ray drive
+- Access to `/data/media` (NFS mount from the media CT, or bind mount if on the same host)
+- Debian/Ubuntu LXC template
+
+#### Step 2: Pass Through the USB Blu-ray Drive
+
+**On the Proxmox host**, identify the USB device:
+
+```bash
+lsusb
+# Look for your Blu-ray drive, note bus/device
+# e.g., Bus 003 Device 002: ID 2109:0715 VIA Labs, Inc.
+```
+
+Add to the CT config (`/etc/pve/lxc/110.conf`):
+
+```
+lxc.cgroup2.devices.allow: c 11:* rwm
+lxc.mount.entry: /dev/sr0 dev/sr0 none bind,optional,create=file
+lxc.mount.entry: /dev/sg0 dev/sg0 none bind,optional,create=file
+```
+
+Or use Proxmox's USB passthrough in the CT options (Resources → Add → USB passthrough).
+
+#### Step 3: Deploy ARM via Docker
+
+On the ripper CT, create a `docker-compose.yml`:
+
+```yaml
+version: "3.9"
+
+services:
+  arm:
+    image: ghcr.io/automatic-ripping-machine/automatic-ripping-machine:latest
+    container_name: arm
+    privileged: true        # Required for optical drive access
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+      - ARM_UID=1000
+      - ARM_GID=1000
+    volumes:
+      - ./config:/etc/arm
+      - /home/arm/media:/home/arm/media  # Output to /data/media
+      - /dev:/dev:ro                      # Optical drive access
+    devices:
+      - /dev/sr0:/dev/sr0
+      - /dev/sg0:/dev/sg0
+    ports:
+      - "8085:8080"   # ARM web UI
+    restart: unless-stopped
+```
+
+Mount the `/data/media` directory from your media CT via NFS or SSHFS so the ripper can write directly where Jellyfin reads.
+
+#### Step 4: Configure ARM
+
+1. Access web UI at `http://<ripper-ct-ip>:8085`
+2. Set up:
+   - **Ripper**: MakeMKV (best quality, lossless)
+   - **Transcoder**: HandBrakeCLI → H.265 (saves ~50% space over raw MKV)
+   - **Output**: `/home/arm/media/movies`
+   - **Naming**: `{title} ({year})/{title} ({year})-{source}` for Radarr compatibility
+3. Insert a test disc to verify the full pipeline
+
+#### Step 5: Integrate with Radarr (Optional but Recommended)
+
+Once the movie lands in `/data/media/movies/Movie Name (2024)/`, Radarr can be configured to:
+- Recognize manual imports
+- Rename according to your naming scheme
+- Trigger re-scan in Jellyfin
+
+This gives you the best of both worlds: ARM handles the raw rip, Radarr handles the organization.
+
+#### Step 6: Verify Backup Coverage
+
+Ripped movies are in `/data/media/movies/`, which is backed up nightly via the rsync script from Part 2. No extra configuration needed.
+
+### Workflow (End-to-End)
+
+```
+1. Walk up to the server, insert a Blu-ray into the USB drive
+2. ARM detects the disc ~30 seconds later
+3. ARM rips with MakeMKV (~15-30 min per movie)
+4. (Optional) HandBrake transcodes to H.265 (~30-60 min)
+5. Movie lands in /data/media/movies/Movie Name (2024)/
+6. Jellyfin picks it up within minutes
+7. Next nightly backup, it's rsynced to PBS
+```
+
+---
+
+## Part 4: Migration Path
 
 ### Phase 1: VPN Integration (Estimated: 30 min)
 
@@ -206,27 +420,53 @@ Or use a single large ZFS pool if that's all you have.
 4. Test: verify qBittorrent IP is your VPN IP, *arrs are on your home IP
 5. Test kill switch: stop Gluetun, verify qBittorrent loses connectivity
 
-### Phase 2: PBS Setup (Estimated: 1-2 hours)
+### Phase 2: PBS Setup (Estimated: 2-3 hours)
 
-1. Install PBS on second node (or LXC)
-2. Create datastores
-3. Configure Proxmox backup schedule for the media CT
-4. Set up rsync-based media backup
-5. Test restore from backup
+1. Wipe and prep your HDDs (ZFS mirror the 2× 1TB, ext4 the 2TB)
+2. Create PBS LXC with HDD passthroughs
+3. Install and configure PBS
+4. Set up Proxmox backup schedule for the media CT
+5. Set up rsync-based media backup script
+6. Test: restore the media CT from PBS backup
 
-### Phase 3: Restore Drill (Estimated: 30 min)
+### Phase 3: Auto-Ripper Setup (Estimated: 1-2 hours)
+
+1. Buy/connect a USB Blu-ray drive
+2. Create ripper CT with USB passthrough
+3. Deploy ARM via Docker
+4. Test with a known disc
+5. Verify Jellyfin picks up the ripped movie
+
+### Phase 4: Restore Drill (Estimated: 30 min)
 
 1. Simulate a failure by taking the media CT offline
 2. Restore from PBS backup
-3. rsync latest media files from PBS
+3. rsync latest media files from PBS HDD
 4. Bring the stack back up
+
+---
+
+## End-to-End Data Flow Summary
+
+```
+Disc → ARM → /data/media/movies/ ──┐
+                                   ├── → Jellyfin (instant)
+Torrent → qBittorrent (VPN)       │
+  → Radarr/Sonarr → /data/media/ ─┘
+                  ↓
+            Daily rsync → PBS LXC (2TB HDD)
+                  ↓
+            Weekly CT backup → PBS LXC (ZFS mirror, 2×1TB)
+                  ↓
+            (Future: second node for true DR)
+```
 
 ---
 
 ## Open Questions
 
-1. **Do you have a second physical machine** for the PBS node, or should we run it as an LXC on the same Proxmox host?
-2. **What's your media library size** (current and projected growth)? This determines PBS storage requirements.
-3. **Do you have a dedicated NordVPN IP** for port forwarding, or should we pick a P2P server?
-4. **Network setup** — are both nodes on the same switch/VLAN, or do they need to route through the firewall?
-5. **Do you want to do a restore drill** after setup to validate the backups actually work?
+1. **Do you have a USB Blu-ray drive** already or need to buy one? If buying, do you want 4K UHD support?
+2. **Where are your HDDs physically** — are they SATA drives you can install inside the Proxmox box, or USB externals?
+3. **Do you want ZFS mirror for the 2× 1TB drives** (redundant but less capacity), or go full JBOD with mergerFS?
+4. **Do you want HandBrake transcoding** in the ripping pipeline, or raw MakeMKV rips? (Raw = full quality, transcode = save space)
+5. **Disk space on the 1TB boot drive** — do you have room for Docker and /data/media on the same SSD, or should /data/media live on one of the HDDs?
