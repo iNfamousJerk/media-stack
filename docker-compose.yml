@@ -1,0 +1,179 @@
+version: "3.9"
+
+# ─── Shared Variables ──────────────────────────────────────────
+# Edit these:
+x-puid: &puid "1000"
+x-pgid: &pgid "1000"
+x-tz: &tz "America/New_York"
+x-dns: &dns
+  - "1.1.1.1"
+  - "1.0.0.1"
+
+services:
+  # ─── qBittorrent ─────────────────────────────────────────────
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    environment:
+      - PUID=*puid
+      - PGID=*pgid
+      - TZ=*tz
+      - WEBUI_PORT=8080
+      - DOCKER_MODS=ghcr.io/gurland/meilisearch:qbittorrent
+    volumes:
+      - ./config/qbittorrent:/config
+      - /data/torrents:/data/torrents
+    ports:
+      - "8080:8080"
+      - "6881:6881"
+      - "6881:6881/udp"
+    dns: *dns
+    restart: unless-stopped
+    networks:
+      - media-stack
+
+  # ─── Radarr ──────────────────────────────────────────────────
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      - PUID=*puid
+      - PGID=*pgid
+      - TZ=*tz
+    volumes:
+      - ./config/radarr:/config
+      - /data:/data
+    ports:
+      - "7878:7878"
+    dns: *dns
+    restart: unless-stopped
+    networks:
+      - media-stack
+
+  # ─── Sonarr ──────────────────────────────────────────────────
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      - PUID=*puid
+      - PGID=*pgid
+      - TZ=*tz
+    volumes:
+      - ./config/sonarr:/config
+      - /data:/data
+    ports:
+      - "8989:8989"
+    dns: *dns
+    restart: unless-stopped
+    networks:
+      - media-stack
+
+  # ─── Prowlarr ────────────────────────────────────────────────
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      - PUID=*puid
+      - PGID=*pgid
+      - TZ=*tz
+    volumes:
+      - ./config/prowlarr:/config
+    ports:
+      - "9696:9696"
+    dns: *dns
+    restart: unless-stopped
+    networks:
+      - media-stack
+
+  # ─── Lidarr ──────────────────────────────────────────────────
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: lidarr
+    environment:
+      - PUID=*puid
+      - PGID=*pgid
+      - TZ=*tz
+    volumes:
+      - ./config/lidarr:/config
+      - /data:/data
+    ports:
+      - "8686:8686"
+    dns: *dns
+    restart: unless-stopped
+    networks:
+      - media-stack
+
+  # ─── Bazarr ──────────────────────────────────────────────────
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    environment:
+      - PUID=*puid
+      - PGID=*pgid
+      - TZ=*tz
+    volumes:
+      - ./config/bazarr:/config
+      - /data:/data
+    ports:
+      - "6767:6767"
+    dns: *dns
+    restart: unless-stopped
+    networks:
+      - media-stack
+
+  # ─── Jellyfin ────────────────────────────────────────────────
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    environment:
+      - PUID=*puid
+      - PGID=*pgid
+      - TZ=*tz
+      - JELLYFIN_PublishedServerUrl=http://localhost:8096
+    volumes:
+      - ./config/jellyfin:/config
+      - /data/media:/data/media
+    ports:
+      - "8096:8096"
+      - "8920:8920"  # HTTPS
+    dns: *dns
+    restart: unless-stopped
+    networks:
+      - media-stack
+
+  # ─── FlareSolverr ────────────────────────────────────────────
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      - CAPTCHA_SOLVER=none
+    ports:
+      - "8191:8191"
+    dns: *dns
+    restart: unless-stopped
+    networks:
+      - media-stack
+
+  # ─── Cross-seed ──────────────────────────────────────────────
+  cross-seed:
+    image: crossseed/cross-seed:latest
+    container_name: cross-seed
+    environment:
+      - PUID=*puid
+      - PGID=*pgid
+      - TZ=*tz
+    volumes:
+      - ./config/cross-seed:/config
+      - /data/torrents:/data/torrents
+    ports:
+      - "2468:2468"
+    dns: *dns
+    restart: unless-stopped
+    networks:
+      - media-stack
+
+networks:
+  media-stack:
+    name: media-stack
+    driver: bridge
