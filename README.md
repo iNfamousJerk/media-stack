@@ -133,7 +133,7 @@ docker ps
 |----------|-------------|
 | [VPN + Backup Architecture](PLANS/01-vpn-and-backup-architecture.md) | NordVPN via Gluetun + Proxmox Backup Server with existing HDDs |
 | [Auto-Ripping Machine](PLANS/02-auto-ripper.md) | USB Blu-ray drive + ARM for automated disc ripping into Jellyfin |
-| [Off-Site Backup](PLANS/03-offsite-backup.md) | Enterprise PC at brother's house + Tailscale + PBS sync for DR |
+| [Off-Site Backup](https://github.com/iNfamousJerk/off-site-backup-pbs) | Enterprise PC at brother's house + Tailscale + PBS sync for DR |
 
 ## 📚 Resources
 
