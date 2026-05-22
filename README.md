@@ -127,6 +127,13 @@ docker compose pull && docker compose up -d
 docker ps
 ```
 
+## 📐 Plans & Upcoming
+
+| Document | Description |
+|----------|-------------|
+| [VPN + Backup Architecture](PLANS/01-vpn-and-backup-architecture.md) | NordVPN via Gluetun + Proxmox Backup Server with existing HDDs |
+| [Auto-Ripping Machine](PLANS/02-auto-ripper.md) | USB Blu-ray drive + ARM for automated disc ripping into Jellyfin |
+
 ## 📚 Resources
 
 - [Trash Guides](https://trash-guides.info) — Configuration best practices
